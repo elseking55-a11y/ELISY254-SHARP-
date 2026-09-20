@@ -8,13 +8,13 @@
     "dev": "node --watch src/server.js"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.16.3",
-    "bcryptjs": "^3.0.2",
-    "metaapi.cloud-sdk": "^29.0.0"
+    "metaapi.cloud-sdk": "^29.0.0",
+    "pg": "^8.16.3"
   }
 }
