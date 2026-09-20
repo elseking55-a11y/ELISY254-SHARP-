@@ -9,23 +9,28 @@ const jwt = require("jsonwebtoken");
 
 const app = express();
 
-/*
-|--------------------------------------------------------------------------
-| CONFIG
-|--------------------------------------------------------------------------
-*/
-
 const PORT = Number(process.env.PORT || 10000);
-
-const JWT_SECRET =
-  process.env.JWT_SECRET ||
-  process.env.ACCESS_TOKEN_SECRET ||
-  "";
 
 const ACCESS_KEY =
   process.env.ACCESS_KEY ||
   process.env.ELISY_ACCESS_KEY ||
   "";
+
+const JWT_SECRET =
+  process.env.JWT_SECRET ||
+  "";
+
+const ADMIN_EMAIL =
+  process.env.ADMIN_EMAIL ||
+  "";
+
+const ADMIN_PASSWORD =
+  process.env.ADMIN_PASSWORD ||
+  "";
+
+const ADMIN_JWT_SECRET =
+  process.env.ADMIN_JWT_SECRET ||
+  JWT_SECRET;
 
 const FRONTEND_URL =
   process.env.FRONTEND_URL ||
@@ -34,58 +39,22 @@ const FRONTEND_URL =
 const TRADING_ENABLED =
   String(process.env.TRADING_ENABLED || "false").toLowerCase() === "true";
 
-const NODE_ENV =
-  process.env.NODE_ENV || "production";
-
-/*
-|--------------------------------------------------------------------------
-| SECURITY CHECK
-|--------------------------------------------------------------------------
-*/
-
-if (!JWT_SECRET) {
-  console.warn(
-    "WARNING: JWT_SECRET is not configured. Authentication tokens cannot be securely created."
-  );
-}
-
-if (!ACCESS_KEY) {
-  console.warn(
-    "WARNING: ACCESS_KEY is not configured. /api/auth/key will reject all access attempts."
-  );
-}
-
-/*
-|--------------------------------------------------------------------------
-| CORS
-|--------------------------------------------------------------------------
-*/
-
 const allowedOrigins = [
   FRONTEND_URL,
   "https://frontend-six-jade-97.vercel.app",
   "http://localhost:5173",
   "http://localhost:3000"
-].filter(Boolean);
+];
 
 app.use(
   cors({
     origin(origin, callback) {
-      /*
-       * Allow requests without an Origin header.
-       * Useful for server-to-server requests and health checks.
-       */
-      if (!origin) {
-        return callback(null, true);
-      }
+      if (!origin) return callback(null, true);
 
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
 
-      /*
-       * Do not crash the backend because of CORS.
-       */
       return callback(null, false);
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -98,31 +67,9 @@ app.use(
 
 app.use(express.json({ limit: "1mb" }));
 
-/*
-|--------------------------------------------------------------------------
-| BASIC REQUEST LOGGER
-|--------------------------------------------------------------------------
-*/
-
-app.use((req, res, next) => {
-  const started = Date.now();
-
-  res.on("finish", () => {
-    const duration = Date.now() - started;
-
-    console.log(
-      `${req.method} ${req.originalUrl} -> ${res.statusCode} (${duration}ms)`
-    );
-  });
-
-  next();
-});
-
-/*
-|--------------------------------------------------------------------------
-| HELPERS
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   HELPERS
+   ========================================================= */
 
 function safeEqual(a, b) {
   if (
@@ -139,12 +86,17 @@ function safeEqual(a, b) {
     return false;
   }
 
-  return crypto.timingSafeEqual(aBuffer, bBuffer);
+  return crypto.timingSafeEqual(
+    aBuffer,
+    bBuffer
+  );
 }
 
-function createToken() {
+function createUserToken() {
   if (!JWT_SECRET) {
-    throw new Error("JWT_SECRET is not configured.");
+    throw new Error(
+      "JWT_SECRET is not configured."
+    );
   }
 
   return jwt.sign(
@@ -159,7 +111,26 @@ function createToken() {
   );
 }
 
-function authenticate(req, res, next) {
+function createAdminToken() {
+  if (!ADMIN_JWT_SECRET) {
+    throw new Error(
+      "ADMIN_JWT_SECRET is not configured."
+    );
+  }
+
+  return jwt.sign(
+    {
+      service: "ELISY254-CLOUD",
+      type: "admin"
+    },
+    ADMIN_JWT_SECRET,
+    {
+      expiresIn: "12h"
+    }
+  );
+}
+
+function authenticateUser(req, res, next) {
   try {
     const authorization =
       req.headers.authorization || "";
@@ -173,15 +144,9 @@ function authenticate(req, res, next) {
     }
 
     const token =
-      authorization.substring("Bearer ".length).trim();
-
-    if (!token) {
-      return res.status(401).json({
-        ok: false,
-        message: "Authentication token is missing.",
-        code: "TOKEN_MISSING"
-      });
-    }
+      authorization
+        .substring(7)
+        .trim();
 
     if (!JWT_SECRET) {
       return res.status(503).json({
@@ -191,20 +156,13 @@ function authenticate(req, res, next) {
       });
     }
 
-    const decoded = jwt.verify(
+    req.user = jwt.verify(
       token,
       JWT_SECRET
     );
 
-    req.user = decoded;
-
     next();
   } catch (error) {
-    console.error(
-      "Authentication error:",
-      error.message
-    );
-
     return res.status(401).json({
       ok: false,
       message: "Invalid or expired session.",
@@ -213,11 +171,60 @@ function authenticate(req, res, next) {
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| ROOT
-|--------------------------------------------------------------------------
-*/
+function authenticateAdmin(req, res, next) {
+  try {
+    const authorization =
+      req.headers.authorization || "";
+
+    if (!authorization.startsWith("Bearer ")) {
+      return res.status(401).json({
+        ok: false,
+        message: "Admin authentication required.",
+        code: "ADMIN_AUTH_REQUIRED"
+      });
+    }
+
+    const token =
+      authorization
+        .substring(7)
+        .trim();
+
+    if (!ADMIN_JWT_SECRET) {
+      return res.status(503).json({
+        ok: false,
+        message: "Admin authentication is not configured.",
+        code: "ADMIN_AUTH_CONFIG_ERROR"
+      });
+    }
+
+    const decoded = jwt.verify(
+      token,
+      ADMIN_JWT_SECRET
+    );
+
+    if (decoded.type !== "admin") {
+      return res.status(403).json({
+        ok: false,
+        message: "Admin access required.",
+        code: "ADMIN_ACCESS_REQUIRED"
+      });
+    }
+
+    req.admin = decoded;
+
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      ok: false,
+      message: "Invalid or expired admin session.",
+      code: "INVALID_ADMIN_TOKEN"
+    });
+  }
+}
+
+/* =========================================================
+   ROOT
+   ========================================================= */
 
 app.get("/", (req, res) => {
   res.json({
@@ -228,22 +235,16 @@ app.get("/", (req, res) => {
   });
 });
 
-/*
-|--------------------------------------------------------------------------
-| HEALTH
-|--------------------------------------------------------------------------
-|
-| The frontend uses this endpoint before asking for the access key.
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   HEALTH
+   ========================================================= */
 
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
 
     backend: {
-      status: "online",
-      environment: NODE_ENV
+      status: "online"
     },
 
     trading: {
@@ -258,21 +259,9 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-/*
-|--------------------------------------------------------------------------
-| ACCESS KEY LOGIN
-|--------------------------------------------------------------------------
-|
-| FRONTEND:
-|
-| POST /api/auth/key
-|
-| {
-|   "accessKey": "YOUR_KEY"
-| }
-|
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   USER ACCESS KEY
+   ========================================================= */
 
 app.post("/api/auth/key", (req, res) => {
   try {
@@ -281,18 +270,17 @@ app.post("/api/auth/key", (req, res) => {
         ? req.body.accessKey.trim()
         : "";
 
-    /*
-     * Never reveal whether the configured key exists.
-     */
     if (!ACCESS_KEY) {
       console.error(
-        "ACCESS_KEY is missing from Render environment variables."
+        "ACCESS_KEY is missing."
       );
 
       return res.status(503).json({
         ok: false,
-        message: "Access service is temporarily unavailable.",
-        code: "ACCESS_SERVICE_NOT_CONFIGURED"
+        message:
+          "Access service is temporarily unavailable.",
+        code:
+          "ACCESS_SERVICE_NOT_CONFIGURED"
       });
     }
 
@@ -304,7 +292,10 @@ app.post("/api/auth/key", (req, res) => {
       });
     }
 
-    if (!safeEqual(suppliedKey, ACCESS_KEY)) {
+    if (!safeEqual(
+      suppliedKey,
+      ACCESS_KEY
+    )) {
       return res.status(401).json({
         ok: false,
         message: "Invalid access key.",
@@ -312,10 +303,8 @@ app.post("/api/auth/key", (req, res) => {
       });
     }
 
-    /*
-     * Correct key.
-     */
-    const token = createToken();
+    const token =
+      createUserToken();
 
     return res.json({
       ok: true,
@@ -334,55 +323,189 @@ app.post("/api/auth/key", (req, res) => {
 
     return res.status(503).json({
       ok: false,
-      message: "Access service is temporarily unavailable.",
+      message:
+        "Access service is temporarily unavailable.",
       code: "ACCESS_SERVICE_ERROR"
     });
   }
 });
 
-/*
-|--------------------------------------------------------------------------
-| CURRENT SESSION
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   USER SESSION
+   ========================================================= */
 
 app.get(
   "/api/auth/me",
-  authenticate,
+  authenticateUser,
+  (req, res) => {
+    res.json({
+      ok: true,
+      authenticated: true
+    });
+  }
+);
+
+/* =========================================================
+   ADMIN LOGIN
+   ========================================================= */
+
+app.post("/api/admin/login", (req, res) => {
+  try {
+    const email =
+      typeof req.body?.email === "string"
+        ? req.body.email.trim()
+        : "";
+
+    const password =
+      typeof req.body?.password === "string"
+        ? req.body.password
+        : "";
+
+    if (
+      !ADMIN_EMAIL ||
+      !ADMIN_PASSWORD ||
+      !ADMIN_JWT_SECRET
+    ) {
+      console.error(
+        "Admin authentication environment variables are missing."
+      );
+
+      return res.status(503).json({
+        ok: false,
+        message:
+          "Admin service is temporarily unavailable.",
+        code:
+          "ADMIN_SERVICE_NOT_CONFIGURED"
+      });
+    }
+
+    if (!email || !password) {
+      return res.status(400).json({
+        ok: false,
+        message:
+          "Admin email and password are required.",
+        code:
+          "ADMIN_CREDENTIALS_REQUIRED"
+      });
+    }
+
+    const validEmail =
+      safeEqual(
+        email.toLowerCase(),
+        ADMIN_EMAIL.toLowerCase()
+      );
+
+    const validPassword =
+      safeEqual(
+        password,
+        ADMIN_PASSWORD
+      );
+
+    if (!validEmail || !validPassword) {
+      return res.status(401).json({
+        ok: false,
+        message:
+          "Invalid admin credentials.",
+        code:
+          "INVALID_ADMIN_CREDENTIALS"
+      });
+    }
+
+    const token =
+      createAdminToken();
+
+    return res.json({
+      ok: true,
+      message: "Admin login successful.",
+      token,
+      admin: {
+        authenticated: true,
+        email: ADMIN_EMAIL
+      }
+    });
+
+  } catch (error) {
+    console.error(
+      "Admin login error:",
+      error
+    );
+
+    return res.status(503).json({
+      ok: false,
+      message:
+        "Admin service is temporarily unavailable.",
+      code: "ADMIN_LOGIN_ERROR"
+    });
+  }
+});
+
+/* =========================================================
+   ADMIN SESSION
+   ========================================================= */
+
+app.get(
+  "/api/admin/me",
+  authenticateAdmin,
   (req, res) => {
     res.json({
       ok: true,
       authenticated: true,
-      user: {
-        type: "access-key-user"
+      admin: {
+        email: req.admin.email ||
+          ADMIN_EMAIL
       }
     });
   }
 );
 
-/*
-|--------------------------------------------------------------------------
-| MT5 STATUS
-|--------------------------------------------------------------------------
-|
-| IMPORTANT:
-| This route deliberately does NOT claim MT5 is connected unless a real
-| integration is configured.
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   ADMIN DASHBOARD
+   ========================================================= */
+
+app.get(
+  "/api/admin/dashboard",
+  authenticateAdmin,
+  (req, res) => {
+    res.json({
+      ok: true,
+
+      platform: {
+        name: "ELISY254 CLOUD",
+        status: "online"
+      },
+
+      statistics: {
+        users: 0,
+        connectedMt5: 0,
+        activeBots: 0,
+        tradesToday: 0,
+        failedOrders: 0,
+        aiRequests: 0
+      },
+
+      mt5: {
+        status: "NOT_CONNECTED"
+      },
+
+      trading: {
+        enabled: TRADING_ENABLED
+      },
+
+      timestamp:
+        new Date().toISOString()
+    });
+  }
+);
+
+/* =========================================================
+   MT5 STATUS
+   ========================================================= */
 
 app.get(
   "/api/mt5/status",
-  authenticate,
+  authenticateUser,
   async (req, res) => {
     try {
-      /*
-       * At this stage we only report a real connection if the backend
-       * has been configured with the necessary integration.
-       *
-       * We do NOT return fake balance, equity, account number, etc.
-       */
-
       const metaApiConfigured =
         Boolean(
           process.env.METAAPI_TOKEN &&
@@ -401,15 +524,6 @@ app.get(
         });
       }
 
-      /*
-       * MetaApi credentials exist.
-       *
-       * The actual MetaApi account connection should be implemented
-       * here when the MetaApi SDK is installed/configured.
-       *
-       * We still do not fake CONNECTED.
-       */
-
       return res.json({
         ok: true,
         connected: false,
@@ -417,7 +531,7 @@ app.get(
         account: null,
         provider: "METAAPI",
         message:
-          "MetaApi credentials are configured, but the MT5 connection has not been verified by the trading adapter."
+          "MT5 connection has not yet been verified."
       });
 
     } catch (error) {
@@ -438,20 +552,13 @@ app.get(
   }
 );
 
-/*
-|--------------------------------------------------------------------------
-| REAL TRADE ENDPOINT
-|--------------------------------------------------------------------------
-|
-| This endpoint refuses to pretend that a trade happened.
-|
-| Until the real MT5/MetaApi adapter is connected, orders are blocked.
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   TRADE
+   ========================================================= */
 
 app.post(
   "/api/trade",
-  authenticate,
+  authenticateUser,
   async (req, res) => {
     try {
       if (!TRADING_ENABLED) {
@@ -460,7 +567,8 @@ app.post(
           executed: false,
           message:
             "Real trading is disabled by the server.",
-          code: "TRADING_DISABLED"
+          code:
+            "TRADING_DISABLED"
         });
       }
 
@@ -476,10 +584,6 @@ app.post(
 
       const volume =
         Number(req.body?.volume);
-
-      /*
-       * Basic validation.
-       */
 
       if (
         side !== "BUY" &&
@@ -517,21 +621,18 @@ app.post(
         });
       }
 
-      /*
-       * Do not execute anything until a real MT5 adapter is installed.
-       */
-
       return res.status(503).json({
         ok: false,
         executed: false,
         message:
           "Real MT5 trading connection is not configured. No order was sent.",
-        code: "MT5_NOT_CONNECTED"
+        code:
+          "MT5_NOT_CONNECTED"
       });
 
     } catch (error) {
       console.error(
-        "Trade endpoint error:",
+        "Trade error:",
         error
       );
 
@@ -539,49 +640,50 @@ app.post(
         ok: false,
         executed: false,
         message:
-          "Trade request failed. No order confirmation was returned.",
-        code: "TRADE_ERROR"
+          "Trade request failed.",
+        code:
+          "TRADE_ERROR"
       });
     }
   }
 );
 
-/*
-|--------------------------------------------------------------------------
-| SERVER INFO
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   GENERAL STATUS
+   ========================================================= */
 
 app.get(
   "/api/status",
-  authenticate,
+  authenticateUser,
   (req, res) => {
     res.json({
       ok: true,
-      service: "ELISY254 CLOUD",
+      service:
+        "ELISY254 CLOUD",
       backend: "online",
 
       trading: {
-        enabled: TRADING_ENABLED
+        enabled:
+          TRADING_ENABLED
       },
 
       mt5: {
-        configured: Boolean(
-          process.env.METAAPI_TOKEN &&
-          process.env.METAAPI_ACCOUNT_ID
-        )
+        configured:
+          Boolean(
+            process.env.METAAPI_TOKEN &&
+            process.env.METAAPI_ACCOUNT_ID
+          )
       },
 
-      timestamp: new Date().toISOString()
+      timestamp:
+        new Date().toISOString()
     });
   }
 );
 
-/*
-|--------------------------------------------------------------------------
-| 404
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   404
+   ========================================================= */
 
 app.use((req, res) => {
   res.status(404).json({
@@ -592,11 +694,9 @@ app.use((req, res) => {
   });
 });
 
-/*
-|--------------------------------------------------------------------------
-| GLOBAL ERROR HANDLER
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   ERROR HANDLER
+   ========================================================= */
 
 app.use(
   (error, req, res, next) => {
@@ -611,40 +711,64 @@ app.use(
 
     res.status(500).json({
       ok: false,
-      message: "Internal server error.",
-      code: "INTERNAL_ERROR"
+      message:
+        "Internal server error.",
+      code:
+        "INTERNAL_ERROR"
     });
   }
 );
 
-/*
-|--------------------------------------------------------------------------
-| START
-|--------------------------------------------------------------------------
-*/
+/* =========================================================
+   START
+   ========================================================= */
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("");
-  console.log("==========================================");
-  console.log("       ELISY254 CLOUD BACKEND");
-  console.log("==========================================");
-  console.log(`PORT: ${PORT}`);
-  console.log(`ENVIRONMENT: ${NODE_ENV}`);
-  console.log(
-    `TRADING_ENABLED: ${TRADING_ENABLED}`
-  );
-  console.log(
-    `ACCESS_KEY_CONFIGURED: ${Boolean(ACCESS_KEY)}`
-  );
-  console.log(
-    `JWT_SECRET_CONFIGURED: ${Boolean(JWT_SECRET)}`
-  );
-  console.log(
-    `METAAPI_CONFIGURED: ${Boolean(
-      process.env.METAAPI_TOKEN &&
-      process.env.METAAPI_ACCOUNT_ID
-    )}`
-  );
-  console.log("==========================================");
-  console.log("");
-});
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      "=========================================="
+    );
+
+    console.log(
+      "       ELISY254 CLOUD BACKEND"
+    );
+
+    console.log(
+      "=========================================="
+    );
+
+    console.log(
+      `PORT: ${PORT}`
+    );
+
+    console.log(
+      `ACCESS_KEY_CONFIGURED: ${Boolean(ACCESS_KEY)}`
+    );
+
+    console.log(
+      `JWT_SECRET_CONFIGURED: ${Boolean(JWT_SECRET)}`
+    );
+
+    console.log(
+      `ADMIN_EMAIL_CONFIGURED: ${Boolean(ADMIN_EMAIL)}`
+    );
+
+    console.log(
+      `ADMIN_PASSWORD_CONFIGURED: ${Boolean(ADMIN_PASSWORD)}`
+    );
+
+    console.log(
+      `ADMIN_JWT_SECRET_CONFIGURED: ${Boolean(ADMIN_JWT_SECRET)}`
+    );
+
+    console.log(
+      `TRADING_ENABLED: ${TRADING_ENABLED}`
+    );
+
+    console.log(
+      "=========================================="
+    );
+  }
+);
