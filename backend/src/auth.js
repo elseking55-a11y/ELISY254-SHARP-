@@ -21,6 +21,19 @@ export function createToken(user) {
   );
 }
 
+export function createAdminToken() {
+  return jwt.sign(
+    {
+      sub: "admin",
+      role: "ADMIN"
+    },
+    process.env.JWT_SECRET,
+    {
+      expiresIn: "12h"
+    }
+  );
+}
+
 export function verifyToken(req, res, next) {
   try {
     const header =
@@ -50,6 +63,21 @@ export function verifyToken(req, res, next) {
       message: "Invalid or expired session"
     });
   }
+}
+
+export function requireAdmin(
+  req,
+  res,
+  next
+) {
+  if (!req.user || req.user.role !== "ADMIN") {
+    return res.status(403).json({
+      ok: false,
+      message: "Admin access required"
+    });
+  }
+
+  next();
 }
 
 export { hashKey };
