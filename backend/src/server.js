@@ -1,1054 +1,650 @@
-import "dotenv/config";
+"use strict";
 
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import crypto from "crypto";
+require("dotenv").config();
 
-import { query } from "./db.js";
-import {
-  createToken,
-  createAdminToken,
-  verifyToken,
-  requireAdmin,
-  hashKey
-} from "./auth.js";
-
-import {
-  getConnectionStatus,
-  getAccountInformation,
-  getPositions,
-  createMarketOrder
-} from "./mt5.js";
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 
+/*
+|--------------------------------------------------------------------------
+| CONFIG
+|--------------------------------------------------------------------------
+*/
+
 const PORT = Number(process.env.PORT || 10000);
 
-const FRONTEND_ORIGIN = String(
-  process.env.FRONTEND_ORIGIN || ""
-).trim();
+const JWT_SECRET =
+  process.env.JWT_SECRET ||
+  process.env.ACCESS_TOKEN_SECRET ||
+  "";
+
+const ACCESS_KEY =
+  process.env.ACCESS_KEY ||
+  process.env.ELISY_ACCESS_KEY ||
+  "";
+
+const FRONTEND_URL =
+  process.env.FRONTEND_URL ||
+  "https://frontend-six-jade-97.vercel.app";
+
+const TRADING_ENABLED =
+  String(process.env.TRADING_ENABLED || "false").toLowerCase() === "true";
+
+const NODE_ENV =
+  process.env.NODE_ENV || "production";
+
+/*
+|--------------------------------------------------------------------------
+| SECURITY CHECK
+|--------------------------------------------------------------------------
+*/
+
+if (!JWT_SECRET) {
+  console.warn(
+    "WARNING: JWT_SECRET is not configured. Authentication tokens cannot be securely created."
+  );
+}
+
+if (!ACCESS_KEY) {
+  console.warn(
+    "WARNING: ACCESS_KEY is not configured. /api/auth/key will reject all access attempts."
+  );
+}
+
+/*
+|--------------------------------------------------------------------------
+| CORS
+|--------------------------------------------------------------------------
+*/
+
+const allowedOrigins = [
+  FRONTEND_URL,
+  "https://frontend-six-jade-97.vercel.app",
+  "http://localhost:5173",
+  "http://localhost:3000"
+].filter(Boolean);
 
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN || true,
-    credentials: true
-  })
-);
+    origin(origin, callback) {
+      /*
+       * Allow requests without an Origin header.
+       * Useful for server-to-server requests and health checks.
+       */
+      if (!origin) {
+        return callback(null, true);
+      }
 
-app.use(
-  helmet({
-    crossOriginResourcePolicy: false
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      /*
+       * Do not crash the backend because of CORS.
+       */
+      return callback(null, false);
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization"
+    ]
   })
 );
 
 app.use(express.json({ limit: "1mb" }));
 
-/* =========================================================
-   BASIC
-========================================================= */
+/*
+|--------------------------------------------------------------------------
+| BASIC REQUEST LOGGER
+|--------------------------------------------------------------------------
+*/
+
+app.use((req, res, next) => {
+  const started = Date.now();
+
+  res.on("finish", () => {
+    const duration = Date.now() - started;
+
+    console.log(
+      `${req.method} ${req.originalUrl} -> ${res.statusCode} (${duration}ms)`
+    );
+  });
+
+  next();
+});
+
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
+
+function safeEqual(a, b) {
+  if (
+    typeof a !== "string" ||
+    typeof b !== "string"
+  ) {
+    return false;
+  }
+
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
+}
+
+function createToken() {
+  if (!JWT_SECRET) {
+    throw new Error("JWT_SECRET is not configured.");
+  }
+
+  return jwt.sign(
+    {
+      service: "ELISY254-CLOUD",
+      type: "user-access"
+    },
+    JWT_SECRET,
+    {
+      expiresIn: "7d"
+    }
+  );
+}
+
+function authenticate(req, res, next) {
+  try {
+    const authorization =
+      req.headers.authorization || "";
+
+    if (!authorization.startsWith("Bearer ")) {
+      return res.status(401).json({
+        ok: false,
+        message: "Authentication required.",
+        code: "AUTH_REQUIRED"
+      });
+    }
+
+    const token =
+      authorization.substring("Bearer ".length).trim();
+
+    if (!token) {
+      return res.status(401).json({
+        ok: false,
+        message: "Authentication token is missing.",
+        code: "TOKEN_MISSING"
+      });
+    }
+
+    if (!JWT_SECRET) {
+      return res.status(503).json({
+        ok: false,
+        message: "Authentication service is not configured.",
+        code: "AUTH_CONFIG_ERROR"
+      });
+    }
+
+    const decoded = jwt.verify(
+      token,
+      JWT_SECRET
+    );
+
+    req.user = decoded;
+
+    next();
+  } catch (error) {
+    console.error(
+      "Authentication error:",
+      error.message
+    );
+
+    return res.status(401).json({
+      ok: false,
+      message: "Invalid or expired session.",
+      code: "INVALID_TOKEN"
+    });
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| ROOT
+|--------------------------------------------------------------------------
+*/
 
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "ELISY254 CLOUD",
+    name: "ELISY254 CLOUD",
+    status: "online",
     message: "Backend is running"
   });
 });
 
-/* =========================================================
-   HEALTH
-========================================================= */
+/*
+|--------------------------------------------------------------------------
+| HEALTH
+|--------------------------------------------------------------------------
+|
+| The frontend uses this endpoint before asking for the access key.
+|--------------------------------------------------------------------------
+*/
 
-app.get("/api/health", async (req, res) => {
-  let database = "offline";
-
-  try {
-    await query("SELECT 1");
-    database = "online";
-  } catch {
-    database = "offline";
-  }
-
-  const mt5 = getConnectionStatus();
-
+app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
-    service: "ELISY254 CLOUD",
 
     backend: {
-      status: "online"
+      status: "online",
+      environment: NODE_ENV
     },
 
-    database,
-
-    mt5,
-
     trading: {
-      enabled:
-        String(process.env.TRADING_ENABLED || "false").toLowerCase() ===
-        "true",
-      status:
-        String(process.env.TRADING_ENABLED || "false").toLowerCase() ===
-        "true"
-          ? "ENABLED"
-          : "DISABLED"
-    }
+      enabled: TRADING_ENABLED
+    },
+
+    mt5: {
+      status: "NOT_CONNECTED"
+    },
+
+    timestamp: new Date().toISOString()
   });
 });
 
-/* =========================================================
-   ACCESS KEY
-========================================================= */
+/*
+|--------------------------------------------------------------------------
+| ACCESS KEY LOGIN
+|--------------------------------------------------------------------------
+|
+| FRONTEND:
+|
+| POST /api/auth/key
+|
+| {
+|   "accessKey": "YOUR_KEY"
+| }
+|
+|--------------------------------------------------------------------------
+*/
 
-app.post("/api/auth/key", async (req, res) => {
+app.post("/api/auth/key", (req, res) => {
   try {
-    const accessKey = String(
-      req.body?.accessKey || ""
-    ).trim();
+    const suppliedKey =
+      typeof req.body?.accessKey === "string"
+        ? req.body.accessKey.trim()
+        : "";
 
-    if (!accessKey) {
-      return res.status(400).json({
-        ok: false,
-        code: "ACCESS_KEY_REQUIRED",
-        message: "Enter your access key."
-      });
-    }
-
-    const configuredKey = String(
-      process.env.ELISY_ACCESS_KEY || ""
-    ).trim();
-
-    if (!configuredKey) {
-      console.error("ELISY_ACCESS_KEY is missing on Render.");
+    /*
+     * Never reveal whether the configured key exists.
+     */
+    if (!ACCESS_KEY) {
+      console.error(
+        "ACCESS_KEY is missing from Render environment variables."
+      );
 
       return res.status(503).json({
         ok: false,
-        code: "ACCESS_SYSTEM_NOT_CONFIGURED",
-        message: "Access system is not configured yet."
+        message: "Access service is temporarily unavailable.",
+        code: "ACCESS_SERVICE_NOT_CONFIGURED"
       });
     }
 
-    const suppliedHash = hashKey(accessKey);
-    const configuredHash = hashKey(configuredKey);
+    if (!suppliedKey) {
+      return res.status(400).json({
+        ok: false,
+        message: "Enter your access key.",
+        code: "ACCESS_KEY_REQUIRED"
+      });
+    }
 
-    const suppliedBuffer = Buffer.from(suppliedHash);
-    const configuredBuffer = Buffer.from(configuredHash);
-
-    if (
-      suppliedBuffer.length !== configuredBuffer.length ||
-      !crypto.timingSafeEqual(
-        suppliedBuffer,
-        configuredBuffer
-      )
-    ) {
+    if (!safeEqual(suppliedKey, ACCESS_KEY)) {
       return res.status(401).json({
         ok: false,
-        code: "ACCESS_KEY_INVALID",
-        message: "The access key is incorrect."
+        message: "Invalid access key.",
+        code: "INVALID_ACCESS_KEY"
       });
     }
 
     /*
-      The key is valid.
-
-      We create/reuse the platform user automatically.
-      The actual MT5 account is NOT created here.
-    */
-
-    let result = await query(
-      `
-      SELECT id, email, role, status
-      FROM users
-      WHERE access_key_hash = $1
-      LIMIT 1
-      `,
-      [suppliedHash]
-    );
-
-    let user;
-
-    if (result.rows.length > 0) {
-      user = result.rows[0];
-
-      if (user.status !== "ACTIVE") {
-        return res.status(403).json({
-          ok: false,
-          code: "USER_DISABLED",
-          message: "This account is disabled."
-        });
-      }
-    } else {
-      const userId = crypto.randomUUID();
-
-      result = await query(
-        `
-        INSERT INTO users (
-          id,
-          email,
-          access_key_hash,
-          role,
-          status
-        )
-        VALUES ($1, $2, $3, 'USER', 'ACTIVE')
-        RETURNING id, email, role, status
-        `,
-        [
-          userId,
-          null,
-          suppliedHash
-        ]
-      );
-
-      user = result.rows[0];
-
-      await query(
-        `
-        INSERT INTO risk_settings (
-          user_id
-        )
-        VALUES ($1)
-        ON CONFLICT (user_id) DO NOTHING
-        `,
-        [user.id]
-      );
-    }
-
-    const token = createToken(user);
+     * Correct key.
+     */
+    const token = createToken();
 
     return res.json({
       ok: true,
-      message: "Access verified.",
+      message: "Access granted.",
       token,
-
       user: {
-        id: user.id,
-        role: user.role,
-        status: user.status
-      },
-
-      mt5: {
-        status: "NOT_CONNECTED",
-        realConnectionRequired: true
-      },
-
-      trading: {
-        status: "DISABLED"
+        authenticated: true
       }
     });
-  } catch (error) {
-    console.error("ACCESS KEY ERROR:", error);
 
-    return res.status(500).json({
+  } catch (error) {
+    console.error(
+      "Access key error:",
+      error
+    );
+
+    return res.status(503).json({
       ok: false,
-      code: "ACCESS_SERVER_ERROR",
-      message: "The access service is temporarily unavailable."
+      message: "Access service is temporarily unavailable.",
+      code: "ACCESS_SERVICE_ERROR"
     });
   }
 });
 
-/* =========================================================
-   CURRENT USER
-========================================================= */
+/*
+|--------------------------------------------------------------------------
+| CURRENT SESSION
+|--------------------------------------------------------------------------
+*/
 
 app.get(
-  "/api/account",
-  verifyToken,
-  async (req, res) => {
-    try {
-      const result = await query(
-        `
-        SELECT
-          id,
-          email,
-          role,
-          status,
-          created_at
-        FROM users
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [req.user.sub]
-      );
-
-      if (!result.rows.length) {
-        return res.status(404).json({
-          ok: false,
-          code: "USER_NOT_FOUND",
-          message: "Account was not found."
-        });
-      }
-
-      const user = result.rows[0];
-
-      res.json({
-        ok: true,
-        user,
-        mt5: {
-          status: "NOT_CONNECTED"
-        }
-      });
-    } catch (error) {
-      console.error(error);
-
-      res.status(500).json({
-        ok: false,
-        code: "ACCOUNT_ERROR",
-        message: "Unable to load account."
-      });
-    }
-  }
-);
-
-/* =========================================================
-   MT5 STATUS
-========================================================= */
-
-app.get(
-  "/api/mt5/status",
-  verifyToken,
-  async (req, res) => {
-    try {
-      const result = await query(
-        `
-        SELECT
-          id,
-          metaapi_account_id,
-          login,
-          server,
-          platform,
-          status
-        FROM mt5_accounts
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1
-        `,
-        [req.user.sub]
-      );
-
-      if (!result.rows.length) {
-        return res.json({
-          ok: true,
-          connected: false,
-          status: "NOT_CONNECTED",
-          account: null
-        });
-      }
-
-      const account = result.rows[0];
-
-      /*
-        Do not claim CONNECTED merely because a database
-        record exists. The real MT5 API must confirm it.
-      */
-
-      if (!account.metaapi_account_id) {
-        return res.json({
-          ok: true,
-          connected: false,
-          status: "NOT_CONNECTED",
-          account: null
-        });
-      }
-
-      if (!String(process.env.METAAPI_TOKEN || "").trim()) {
-        return res.json({
-          ok: true,
-          connected: false,
-          status: "NOT_CONNECTED",
-          account: {
-            login: account.login,
-            server: account.server,
-            platform: account.platform
-          }
-        });
-      }
-
-      try {
-        const information =
-          await getAccountInformation(
-            account.metaapi_account_id
-          );
-
-        return res.json({
-          ok: true,
-          connected: true,
-          status: "CONNECTED",
-
-          account: {
-            login: account.login,
-            server: account.server,
-            platform: account.platform,
-
-            balance: information.balance,
-            equity: information.equity,
-            margin: information.margin,
-            freeMargin: information.freeMargin,
-            currency: information.currency
-          }
-        });
-      } catch (error) {
-        console.error(
-          "REAL MT5 STATUS CHECK FAILED:",
-          error.message
-        );
-
-        return res.json({
-          ok: true,
-          connected: false,
-          status: "NOT_CONNECTED",
-          account: null
-        });
-      }
-    } catch (error) {
-      console.error(error);
-
-      res.status(500).json({
-        ok: false,
-        code: "MT5_STATUS_ERROR",
-        message: "Unable to check MT5 connection."
-      });
-    }
-  }
-);
-
-/* =========================================================
-   POSITIONS
-========================================================= */
-
-app.get(
-  "/api/positions",
-  verifyToken,
-  async (req, res) => {
-    try {
-      const result = await query(
-        `
-        SELECT metaapi_account_id
-        FROM mt5_accounts
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1
-        `,
-        [req.user.sub]
-      );
-
-      if (!result.rows.length) {
-        return res.json({
-          ok: true,
-          connected: false,
-          positions: []
-        });
-      }
-
-      const accountId =
-        result.rows[0].metaapi_account_id;
-
-      if (!String(process.env.METAAPI_TOKEN || "").trim()) {
-        return res.json({
-          ok: true,
-          connected: false,
-          positions: []
-        });
-      }
-
-      const positions =
-        await getPositions(accountId);
-
-      return res.json({
-        ok: true,
-        connected: true,
-        positions
-      });
-    } catch (error) {
-      console.error("POSITIONS ERROR:", error.message);
-
-      return res.status(503).json({
-        ok: false,
-        code: "MT5_NOT_CONNECTED",
-        message: "MT5 is not connected.",
-        positions: []
-      });
-    }
-  }
-);
-
-/* =========================================================
-   RISK GET
-========================================================= */
-
-app.get(
-  "/api/risk",
-  verifyToken,
-  async (req, res) => {
-    try {
-      const result = await query(
-        `
-        SELECT *
-        FROM risk_settings
-        WHERE user_id = $1
-        `,
-        [req.user.sub]
-      );
-
-      if (!result.rows.length) {
-        await query(
-          `
-          INSERT INTO risk_settings (user_id)
-          VALUES ($1)
-          ON CONFLICT (user_id) DO NOTHING
-          `,
-          [req.user.sub]
-        );
-
-        const fresh = await query(
-          `
-          SELECT *
-          FROM risk_settings
-          WHERE user_id = $1
-          `,
-          [req.user.sub]
-        );
-
-        return res.json({
-          ok: true,
-          risk: fresh.rows[0]
-        });
-      }
-
-      res.json({
-        ok: true,
-        risk: result.rows[0]
-      });
-    } catch (error) {
-      console.error(error);
-
-      res.status(500).json({
-        ok: false,
-        code: "RISK_LOAD_ERROR",
-        message: "Unable to load risk settings."
-      });
-    }
-  }
-);
-
-/* =========================================================
-   RISK UPDATE
-========================================================= */
-
-app.put(
-  "/api/risk",
-  verifyToken,
-  async (req, res) => {
-    try {
-      const body = req.body || {};
-
-      const allowedBoolean = [
-        "martingale_enabled",
-        "recovery_enabled",
-        "daily_loss_enabled",
-        "stop_loss_enabled",
-        "take_profit_enabled",
-        "trade_size_enabled",
-        "margin_check_enabled",
-        "max_positions_enabled"
-      ];
-
-      const booleans = {};
-
-      for (const field of allowedBoolean) {
-        if (field in body) {
-          booleans[field] = Boolean(body[field]);
-        }
-      }
-
-      const riskPercent =
-        Number(body.risk_percent ?? 0.5);
-
-      const dailyLossPercent =
-        Number(body.daily_loss_percent ?? 2);
-
-      const maxPositions =
-        Number(body.max_positions ?? 1);
-
-      if (
-        !Number.isFinite(riskPercent) ||
-        riskPercent <= 0 ||
-        riskPercent > 100
-      ) {
-        return res.status(400).json({
-          ok: false,
-          code: "INVALID_RISK",
-          message: "Invalid risk percentage."
-        });
-      }
-
-      if (
-        !Number.isFinite(dailyLossPercent) ||
-        dailyLossPercent <= 0 ||
-        dailyLossPercent > 100
-      ) {
-        return res.status(400).json({
-          ok: false,
-          code: "INVALID_DAILY_LOSS",
-          message: "Invalid daily loss limit."
-        });
-      }
-
-      if (
-        !Number.isInteger(maxPositions) ||
-        maxPositions < 1 ||
-        maxPositions > 100
-      ) {
-        return res.status(400).json({
-          ok: false,
-          code: "INVALID_MAX_POSITIONS",
-          message: "Invalid maximum positions."
-        });
-      }
-
-      await query(
-        `
-        INSERT INTO risk_settings (
-          user_id,
-          martingale_enabled,
-          recovery_enabled,
-          daily_loss_enabled,
-          stop_loss_enabled,
-          take_profit_enabled,
-          trade_size_enabled,
-          margin_check_enabled,
-          max_positions_enabled,
-          risk_percent,
-          daily_loss_percent,
-          max_positions,
-          updated_at
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          $7,
-          $8,
-          $9,
-          $10,
-          $11,
-          $12,
-          NOW()
-        )
-        ON CONFLICT (user_id)
-        DO UPDATE SET
-          martingale_enabled = EXCLUDED.martingale_enabled,
-          recovery_enabled = EXCLUDED.recovery_enabled,
-          daily_loss_enabled = EXCLUDED.daily_loss_enabled,
-          stop_loss_enabled = EXCLUDED.stop_loss_enabled,
-          take_profit_enabled = EXCLUDED.take_profit_enabled,
-          trade_size_enabled = EXCLUDED.trade_size_enabled,
-          margin_check_enabled = EXCLUDED.margin_check_enabled,
-          max_positions_enabled = EXCLUDED.max_positions_enabled,
-          risk_percent = EXCLUDED.risk_percent,
-          daily_loss_percent = EXCLUDED.daily_loss_percent,
-          max_positions = EXCLUDED.max_positions,
-          updated_at = NOW()
-        `,
-        [
-          req.user.sub,
-          booleans.martingale_enabled ?? false,
-          booleans.recovery_enabled ?? false,
-          booleans.daily_loss_enabled ?? true,
-          booleans.stop_loss_enabled ?? true,
-          booleans.take_profit_enabled ?? true,
-          booleans.trade_size_enabled ?? true,
-          booleans.margin_check_enabled ?? true,
-          booleans.max_positions_enabled ?? true,
-          riskPercent,
-          dailyLossPercent,
-          maxPositions
-        ]
-      );
-
-      const result = await query(
-        `
-        SELECT *
-        FROM risk_settings
-        WHERE user_id = $1
-        `,
-        [req.user.sub]
-      );
-
-      res.json({
-        ok: true,
-        risk: result.rows[0]
-      });
-    } catch (error) {
-      console.error(error);
-
-      res.status(500).json({
-        ok: false,
-        code: "RISK_UPDATE_ERROR",
-        message: "Unable to save risk settings."
-      });
-    }
-  }
-);
-
-/* =========================================================
-   REAL TRADE
-========================================================= */
-
-app.post(
-  "/api/trade",
-  verifyToken,
-  async (req, res) => {
-    try {
-      const tradingEnabled =
-        String(
-          process.env.TRADING_ENABLED || "false"
-        ).toLowerCase() === "true";
-
-      if (!tradingEnabled) {
-        return res.status(403).json({
-          ok: false,
-          code: "TRADING_DISABLED",
-          message: "Real trading is currently disabled."
-        });
-      }
-
-      const {
-        side,
-        symbol,
-        volume,
-        stopLoss,
-        takeProfit
-      } = req.body || {};
-
-      if (!side || !symbol || !volume) {
-        return res.status(400).json({
-          ok: false,
-          code: "TRADE_FIELDS_REQUIRED",
-          message: "Side, symbol and volume are required."
-        });
-      }
-
-      const accountResult = await query(
-        `
-        SELECT *
-        FROM mt5_accounts
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1
-        `,
-        [req.user.sub]
-      );
-
-      if (!accountResult.rows.length) {
-        return res.status(409).json({
-          ok: false,
-          code: "MT5_NOT_CONNECTED",
-          message: "Connect a real MT5 account before trading."
-        });
-      }
-
-      const account =
-        accountResult.rows[0];
-
-      if (!account.metaapi_account_id) {
-        return res.status(409).json({
-          ok: false,
-          code: "MT5_NOT_CONNECTED",
-          message: "Connect a real MT5 account before trading."
-        });
-      }
-
-      if (
-        !String(process.env.METAAPI_TOKEN || "").trim()
-      ) {
-        return res.status(409).json({
-          ok: false,
-          code: "MT5_API_NOT_CONFIGURED",
-          message: "The real MT5 cloud API is not configured."
-        });
-      }
-
-      const result =
-        await createMarketOrder({
-          accountId: account.metaapi_account_id,
-          side,
-          symbol,
-          volume,
-          stopLoss,
-          takeProfit
-        });
-
-      const tradeId =
-        crypto.randomUUID();
-
-      const brokerOrderId =
-        result?.orderId ||
-        result?.positionId ||
-        null;
-
-      await query(
-        `
-        INSERT INTO trades (
-          id,
-          user_id,
-          account_id,
-          symbol,
-          side,
-          volume,
-          stop_loss,
-          take_profit,
-          mt5_order_id,
-          status,
-          executed_at
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          $7,
-          $8,
-          $9,
-          'EXECUTED',
-          NOW()
-        )
-        `,
-        [
-          tradeId,
-          req.user.sub,
-          account.id,
-          symbol,
-          String(side).toUpperCase(),
-          Number(volume),
-          stopLoss ?? null,
-          takeProfit ?? null,
-          brokerOrderId
-        ]
-      );
-
-      await query(
-        `
-        INSERT INTO audit_logs (
-          id,
-          user_id,
-          action,
-          details
-        )
-        VALUES (
-          $1,
-          $2,
-          'REAL_TRADE_EXECUTED',
-          $3
-        )
-        `,
-        [
-          crypto.randomUUID(),
-          req.user.sub,
-          JSON.stringify({
-            symbol,
-            side,
-            volume,
-            brokerOrderId
-          })
-        ]
-      );
-
-      res.json({
-        ok: true,
-        status: "EXECUTED",
-        tradeId,
-        brokerOrderId,
-        message: "Real MT5 order executed."
-      });
-    } catch (error) {
-      console.error("REAL TRADE ERROR:", error);
-
-      res.status(502).json({
-        ok: false,
-        code: "BROKER_ORDER_FAILED",
-        message:
-          "The broker did not confirm the order.",
-        details: error.message
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN LOGIN
-========================================================= */
-
-app.post(
-  "/api/admin/login",
-  async (req, res) => {
-    try {
-      const email =
-        String(req.body?.email || "").trim();
-
-      const password =
-        String(req.body?.password || "");
-
-      const adminEmail =
-        String(
-          process.env.ADMIN_EMAIL || ""
-        ).trim();
-
-      const adminPassword =
-        String(
-          process.env.ADMIN_PASSWORD || ""
-        );
-
-      if (
-        !adminEmail ||
-        !adminPassword
-      ) {
-        return res.status(503).json({
-          ok: false,
-          code: "ADMIN_NOT_CONFIGURED",
-          message: "Admin login is not configured."
-        });
-      }
-
-      if (
-        email !== adminEmail ||
-        password !== adminPassword
-      ) {
-        return res.status(401).json({
-          ok: false,
-          code: "ADMIN_LOGIN_INVALID",
-          message: "Incorrect administrator credentials."
-        });
-      }
-
-      const token =
-        createAdminToken();
-
-      res.json({
-        ok: true,
-        token,
-        role: "ADMIN"
-      });
-    } catch (error) {
-      console.error(error);
-
-      res.status(500).json({
-        ok: false,
-        code: "ADMIN_LOGIN_ERROR",
-        message: "Administrator login failed."
-      });
-    }
-  }
-);
-
-/* =========================================================
-   ADMIN ME
-========================================================= */
-
-app.get(
-  "/api/admin/me",
-  verifyToken,
-  requireAdmin,
+  "/api/auth/me",
+  authenticate,
   (req, res) => {
     res.json({
       ok: true,
-      role: "ADMIN"
+      authenticated: true,
+      user: {
+        type: "access-key-user"
+      }
     });
   }
 );
 
-/* =========================================================
-   ADMIN DASHBOARD
-========================================================= */
+/*
+|--------------------------------------------------------------------------
+| MT5 STATUS
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+| This route deliberately does NOT claim MT5 is connected unless a real
+| integration is configured.
+|--------------------------------------------------------------------------
+*/
 
 app.get(
-  "/api/admin/dashboard",
-  verifyToken,
-  requireAdmin,
+  "/api/mt5/status",
+  authenticate,
   async (req, res) => {
     try {
-      const users =
-        await query(
-          `SELECT COUNT(*)::int AS count FROM users`
+      /*
+       * At this stage we only report a real connection if the backend
+       * has been configured with the necessary integration.
+       *
+       * We do NOT return fake balance, equity, account number, etc.
+       */
+
+      const metaApiConfigured =
+        Boolean(
+          process.env.METAAPI_TOKEN &&
+          process.env.METAAPI_ACCOUNT_ID
         );
 
-      const accounts =
-        await query(
-          `SELECT COUNT(*)::int AS count FROM mt5_accounts`
-        );
+      if (!metaApiConfigured) {
+        return res.json({
+          ok: true,
+          connected: false,
+          status: "NOT_CONNECTED",
+          account: null,
+          provider: "NONE",
+          message:
+            "No real MT5 cloud connection is configured."
+        });
+      }
 
-      const trades =
-        await query(
-          `SELECT COUNT(*)::int AS count FROM trades`
-        );
+      /*
+       * MetaApi credentials exist.
+       *
+       * The actual MetaApi account connection should be implemented
+       * here when the MetaApi SDK is installed/configured.
+       *
+       * We still do not fake CONNECTED.
+       */
 
-      const bots =
-        await query(
-          `SELECT COUNT(*)::int AS count FROM bots`
-        );
-
-      res.json({
+      return res.json({
         ok: true,
-        dashboard: {
-          users: users.rows[0].count,
-          mt5Accounts: accounts.rows[0].count,
-          trades: trades.rows[0].count,
-          bots: bots.rows[0].count
-        }
+        connected: false,
+        status: "NOT_CONNECTED",
+        account: null,
+        provider: "METAAPI",
+        message:
+          "MetaApi credentials are configured, but the MT5 connection has not been verified by the trading adapter."
       });
-    } catch (error) {
-      console.error(error);
 
-      res.status(500).json({
+    } catch (error) {
+      console.error(
+        "MT5 status error:",
+        error
+      );
+
+      return res.status(503).json({
         ok: false,
-        code: "ADMIN_DASHBOARD_ERROR",
-        message: "Unable to load admin dashboard."
+        connected: false,
+        status: "NOT_CONNECTED",
+        account: null,
+        message:
+          "Unable to verify MT5 connection."
       });
     }
   }
 );
 
-/* =========================================================
-   404
-========================================================= */
+/*
+|--------------------------------------------------------------------------
+| REAL TRADE ENDPOINT
+|--------------------------------------------------------------------------
+|
+| This endpoint refuses to pretend that a trade happened.
+|
+| Until the real MT5/MetaApi adapter is connected, orders are blocked.
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  "/api/trade",
+  authenticate,
+  async (req, res) => {
+    try {
+      if (!TRADING_ENABLED) {
+        return res.status(403).json({
+          ok: false,
+          executed: false,
+          message:
+            "Real trading is disabled by the server.",
+          code: "TRADING_DISABLED"
+        });
+      }
+
+      const side =
+        typeof req.body?.side === "string"
+          ? req.body.side.toUpperCase()
+          : "";
+
+      const symbol =
+        typeof req.body?.symbol === "string"
+          ? req.body.symbol.trim()
+          : "";
+
+      const volume =
+        Number(req.body?.volume);
+
+      /*
+       * Basic validation.
+       */
+
+      if (
+        side !== "BUY" &&
+        side !== "SELL"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          executed: false,
+          message:
+            "Side must be BUY or SELL.",
+          code: "INVALID_SIDE"
+        });
+      }
+
+      if (!symbol) {
+        return res.status(400).json({
+          ok: false,
+          executed: false,
+          message:
+            "Trading symbol is required.",
+          code: "INVALID_SYMBOL"
+        });
+      }
+
+      if (
+        !Number.isFinite(volume) ||
+        volume <= 0
+      ) {
+        return res.status(400).json({
+          ok: false,
+          executed: false,
+          message:
+            "Trade volume must be greater than zero.",
+          code: "INVALID_VOLUME"
+        });
+      }
+
+      /*
+       * Do not execute anything until a real MT5 adapter is installed.
+       */
+
+      return res.status(503).json({
+        ok: false,
+        executed: false,
+        message:
+          "Real MT5 trading connection is not configured. No order was sent.",
+        code: "MT5_NOT_CONNECTED"
+      });
+
+    } catch (error) {
+      console.error(
+        "Trade endpoint error:",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        executed: false,
+        message:
+          "Trade request failed. No order confirmation was returned.",
+        code: "TRADE_ERROR"
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| SERVER INFO
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+  "/api/status",
+  authenticate,
+  (req, res) => {
+    res.json({
+      ok: true,
+      service: "ELISY254 CLOUD",
+      backend: "online",
+
+      trading: {
+        enabled: TRADING_ENABLED
+      },
+
+      mt5: {
+        configured: Boolean(
+          process.env.METAAPI_TOKEN &&
+          process.env.METAAPI_ACCOUNT_ID
+        )
+      },
+
+      timestamp: new Date().toISOString()
+    });
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| 404
+|--------------------------------------------------------------------------
+*/
 
 app.use((req, res) => {
   res.status(404).json({
     ok: false,
+    message: "API route not found.",
     code: "NOT_FOUND",
-    message: "API route not found."
+    path: req.originalUrl
   });
 });
 
-/* =========================================================
-   ERROR HANDLER
-========================================================= */
+/*
+|--------------------------------------------------------------------------
+| GLOBAL ERROR HANDLER
+|--------------------------------------------------------------------------
+*/
 
-app.use((error, req, res, next) => {
-  console.error("SERVER ERROR:", error);
-
-  res.status(500).json({
-    ok: false,
-    code: "SERVER_ERROR",
-    message: "Server error."
-  });
-});
-
-/* =========================================================
-   START
-========================================================= */
-
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `ELISY254 CLOUD listening on port ${PORT}`
+app.use(
+  (error, req, res, next) => {
+    console.error(
+      "Unhandled server error:",
+      error
     );
+
+    if (res.headersSent) {
+      return next(error);
+    }
+
+    res.status(500).json({
+      ok: false,
+      message: "Internal server error.",
+      code: "INTERNAL_ERROR"
+    });
   }
 );
+
+/*
+|--------------------------------------------------------------------------
+| START
+|--------------------------------------------------------------------------
+*/
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("");
+  console.log("==========================================");
+  console.log("       ELISY254 CLOUD BACKEND");
+  console.log("==========================================");
+  console.log(`PORT: ${PORT}`);
+  console.log(`ENVIRONMENT: ${NODE_ENV}`);
+  console.log(
+    `TRADING_ENABLED: ${TRADING_ENABLED}`
+  );
+  console.log(
+    `ACCESS_KEY_CONFIGURED: ${Boolean(ACCESS_KEY)}`
+  );
+  console.log(
+    `JWT_SECRET_CONFIGURED: ${Boolean(JWT_SECRET)}`
+  );
+  console.log(
+    `METAAPI_CONFIGURED: ${Boolean(
+      process.env.METAAPI_TOKEN &&
+      process.env.METAAPI_ACCOUNT_ID
+    )}`
+  );
+  console.log("==========================================");
+  console.log("");
+});
