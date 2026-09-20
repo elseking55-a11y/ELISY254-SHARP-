@@ -1,7 +1,9 @@
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY,
   email TEXT UNIQUE,
-  access_key_hash TEXT NOT NULL,
+  access_key_hash TEXT UNIQUE NOT NULL,
   role TEXT NOT NULL DEFAULT 'USER',
   status TEXT NOT NULL DEFAULT 'ACTIVE',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -70,6 +72,7 @@ CREATE TABLE IF NOT EXISTS trades (
 
   requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   executed_at TIMESTAMPTZ,
+
   error_message TEXT
 );
 
@@ -79,6 +82,14 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   action TEXT NOT NULL,
   details JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS daily_risk (
+  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  risk_date DATE NOT NULL,
+  starting_balance NUMERIC(18,8) NOT NULL DEFAULT 0,
+  starting_equity NUMERIC(18,8) NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 INSERT INTO bots (
@@ -91,7 +102,7 @@ INSERT INTO bots (
 VALUES (
   gen_random_uuid(),
   'ELISY254 ENGINE',
-  'Account-aware trading engine',
+  'Real account-aware trading engine',
   'PUBLISHED',
   'ENGINE'
 )
